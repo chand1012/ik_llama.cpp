@@ -3196,9 +3196,27 @@ void server_context::speculative_decoding_accept() {
 
         if (!llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1)) {
             // Hybrid model: recurrent state restored to pre-speculative checkpoint.
-            // Accepted tokens' KV entries were also cleared; they'll be re-decoded
-            // by the server on the next iteration since cache_tokens > n_past.
-            slot.n_past -= (int)(ids.size() - 1); // undo accepted token count
+            // All KV cells after checkpoint pos were removed (both accepted and rejected).
+            // Re-decode accepted tokens to correctly update both attention KV and recurrent state.
+            llama_pos pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
+            int n_past_new = (int)(pos_max + 1);
+            int n_redecode = slot.n_past - n_past_new;
+
+            if (n_redecode > 0) {
+                llama_batch re_batch = llama_batch_init(n_redecode, 0, 1);
+                for (int i = 0; i < n_redecode; ++i) {
+                    common_batch_add(re_batch,
+                        slot.cache_tokens[n_past_new + i],
+                        n_past_new + i,
+                        { slot.id },
+                        i == n_redecode - 1);
+                }
+                if (llama_decode(ctx, re_batch) != 0) {
+                    SLT_ERR(slot, "failed to re-decode %d accepted tokens for hybrid model rollback\n", n_redecode);
+                }
+                llama_batch_free(re_batch);
+            }
+            // slot.n_past stays correct — matches cache_tokens.n_tokens() after re-decode
         }
 
         for (size_t i = 0; i < ids.size(); ++i) {

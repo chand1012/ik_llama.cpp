@@ -3454,11 +3454,9 @@ static int llama_decode_internal(
                 kv_self.head = 0;
             }
 
-            if (!llama_kv_cache_find_slot(kv_self, u_batch, cparams.mtp_op_type)) {
-                return 1;
-            }
-
-            // Save recurrent state checkpoint for hybrid models (speculative decoding rollback)
+            // Save recurrent state checkpoint for hybrid models BEFORE find_slot
+            // allocates cells. This ensures max_pos reflects the pre-batch state,
+            // not the newly allocated positions.
             if (kv_self.hybrid && llama_kv_has_qnext_state_storage(kv_self)) {
                 std::set<llama_seq_id> batch_seq_ids;
                 for (uint32_t i = 0; i < u_batch.n_tokens; ++i) {
@@ -3469,6 +3467,10 @@ static int llama_decode_internal(
                 for (llama_seq_id sid : batch_seq_ids) {
                     llama_kv_cache_checkpoint_save(kv_self, sid);
                 }
+            }
+
+            if (!llama_kv_cache_find_slot(kv_self, u_batch, cparams.mtp_op_type)) {
+                return 1;
             }
 
             if (!kv_self.recurrent) {

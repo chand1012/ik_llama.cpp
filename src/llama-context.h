@@ -10,6 +10,7 @@ struct llama_model;
 #include <map>
 #include <set>
 #include <memory>
+#include <unordered_map>
 
 struct llama_kv_cell {
     llama_pos pos   = -1;
@@ -64,6 +65,14 @@ struct llama_kv_cache {
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
+
+    // Recurrent state checkpoint for speculative decoding rollback (hybrid models).
+    // Stores a CPU-side copy of s_l rows for one sequence, taken before each decode batch.
+    struct recurrent_checkpoint {
+        llama_pos pos = -1;                           // max position when checkpoint was taken
+        std::vector<std::vector<uint8_t>> layer_data; // per recurrent layer, raw bytes of one s_l row
+    };
+    std::unordered_map<llama_seq_id, recurrent_checkpoint> hybrid_checkpoints;
 
     size_t total_size() const {
         size_t size = 0;

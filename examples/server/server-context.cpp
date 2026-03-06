@@ -3194,7 +3194,12 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+        if (!llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1)) {
+            // Hybrid model: recurrent state restored to pre-speculative checkpoint.
+            // Accepted tokens' KV entries were also cleared; they'll be re-decoded
+            // by the server on the next iteration since cache_tokens > n_past.
+            slot.n_past -= (int)(ids.size() - 1); // undo accepted token count
+        }
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;

@@ -712,6 +712,58 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
+// Save recurrent state checkpoint for a sequence (hybrid models).
+// Captures the s_l row for seq_id so it can be restored on speculative rejection.
+static void llama_kv_cache_checkpoint_save(struct llama_kv_cache & cache, llama_seq_id seq_id) {
+    if (!llama_kv_has_qnext_state_storage(cache) || !llama_kv_qnext_seq_id_in_range(cache, seq_id)) {
+        return;
+    }
+
+    // Find max position for this seq_id in cache cells
+    llama_pos max_pos = -1;
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos > max_pos) {
+            max_pos = cache.cells[i].pos;
+        }
+    }
+
+    llama_kv_cache::recurrent_checkpoint cp;
+    cp.pos = max_pos;
+    cp.layer_data.resize(cache.s_l.size());
+
+    for (size_t il = 0; il < cache.s_l.size(); ++il) {
+        if (cache.s_l[il] == nullptr) {
+            continue;
+        }
+        const size_t row_size = ggml_row_size(cache.s_l[il]->type, cache.s_l[il]->ne[0]);
+        cp.layer_data[il].resize(row_size);
+        ggml_backend_tensor_get(cache.s_l[il], cp.layer_data[il].data(), seq_id * row_size, row_size);
+    }
+
+    cache.hybrid_checkpoints[seq_id] = std::move(cp);
+}
+
+// Restore recurrent state from checkpoint for a sequence.
+// Returns the checkpoint position, or -1 if no checkpoint exists.
+static llama_pos llama_kv_cache_checkpoint_restore(struct llama_kv_cache & cache, llama_seq_id seq_id) {
+    auto it = cache.hybrid_checkpoints.find(seq_id);
+    if (it == cache.hybrid_checkpoints.end()) {
+        return -1;
+    }
+
+    const auto & cp = it->second;
+    for (size_t il = 0; il < cache.s_l.size() && il < cp.layer_data.size(); ++il) {
+        if (cache.s_l[il] == nullptr || cp.layer_data[il].empty()) {
+            continue;
+        }
+        const size_t row_size = ggml_row_size(cache.s_l[il]->type, cache.s_l[il]->ne[0]);
+        ggml_backend_tensor_set(cache.s_l[il], cp.layer_data[il].data(), seq_id * row_size, row_size);
+    }
+
+    llama_pos pos = cp.pos;
+    return pos;
+}
+
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
                const llama_context * ctx,
@@ -1161,6 +1213,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    cache.hybrid_checkpoints.clear();
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
@@ -1197,6 +1250,35 @@ static bool llama_kv_cache_seq_rm(
     }
 
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
+
+    // Hybrid model recurrent state rollback for speculative decoding
+    if (has_qnext_state && seq_id >= 0 && p0 > 0 &&
+        llama_kv_qnext_seq_id_in_range(cache, seq_id)) {
+        auto it = cache.hybrid_checkpoints.find(seq_id);
+        if (it != cache.hybrid_checkpoints.end() && it->second.pos >= 0 && it->second.pos < p0) {
+            // Restore recurrent state to checkpoint
+            llama_kv_cache_checkpoint_restore(cache, seq_id);
+            llama_pos cp_pos = it->second.pos;
+            cache.hybrid_checkpoints.erase(it);
+
+            // Remove ALL cells from cp_pos+1 onwards for this seq_id
+            // (both accepted speculative tokens and rejected ones need re-decode)
+            for (uint32_t i = 0; i < cache.size; ++i) {
+                if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos > cp_pos) {
+                    cache.cells[i].seq_id.erase(seq_id);
+                    if (cache.cells[i].is_empty()) {
+                        if (cache.cells[i].pos >= 0) cache.used--;
+                        cache.cells[i].pos = -1;
+                        cache.cells[i].src = i;
+                        if (new_head == cache.size) new_head = i;
+                    }
+                }
+            }
+            if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+
+            return false; // signal: re-decode needed from cp_pos+1 to p0-1
+        }
+    }
 
     for (uint32_t i = 0; i < cache.size; ++i) {
         if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
@@ -1269,6 +1351,12 @@ static void llama_kv_cache_seq_cp(
         cache.cells[seq_id_dst].src = seq_id_src;
         cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
         cache.do_copy = true;
+
+        // Copy hybrid checkpoint if one exists for the source
+        auto cp_it = cache.hybrid_checkpoints.find(seq_id_src);
+        if (cp_it != cache.hybrid_checkpoints.end()) {
+            cache.hybrid_checkpoints[seq_id_dst] = cp_it->second;
+        }
     }
 
     // otherwise, this is the KV cache of a Transformer-like model
@@ -1303,6 +1391,12 @@ static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id 
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cache.size && new_head < cache.head) cache.head = new_head;
+
+    // Remove hybrid checkpoints for cleared sequences
+    for (auto it = cache.hybrid_checkpoints.begin(); it != cache.hybrid_checkpoints.end(); ) {
+        if (it->first != seq_id) it = cache.hybrid_checkpoints.erase(it);
+        else ++it;
+    }
 }
 
 static void llama_kv_cache_seq_add(
@@ -3362,6 +3456,19 @@ static int llama_decode_internal(
 
             if (!llama_kv_cache_find_slot(kv_self, u_batch, cparams.mtp_op_type)) {
                 return 1;
+            }
+
+            // Save recurrent state checkpoint for hybrid models (speculative decoding rollback)
+            if (kv_self.hybrid && llama_kv_has_qnext_state_storage(kv_self)) {
+                std::set<llama_seq_id> batch_seq_ids;
+                for (uint32_t i = 0; i < u_batch.n_tokens; ++i) {
+                    for (int32_t j = 0; j < u_batch.n_seq_id[i]; ++j) {
+                        batch_seq_ids.insert(u_batch.seq_id[i][j]);
+                    }
+                }
+                for (llama_seq_id sid : batch_seq_ids) {
+                    llama_kv_cache_checkpoint_save(kv_self, sid);
+                }
             }
 
             if (!kv_self.recurrent) {

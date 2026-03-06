@@ -852,9 +852,13 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
 
     // try to remove the last tokens
     if (!llama_kv_cache_seq_rm(ctx_tgt, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = false;
-        goto done;
+        // Hybrid models return false because recurrent state was rolled back.
+        // This is expected behavior, not an incompatibility.
+        if (!llama_model_is_hybrid(llama_get_model(ctx_tgt))) {
+            LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+            res = false;
+            goto done;
+        }
     }
 
 done:
